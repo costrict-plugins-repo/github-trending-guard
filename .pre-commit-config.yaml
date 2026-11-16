@@ -1,0 +1,97 @@
+fail_fast: true
+
+repos:
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ["--baseline", ".secrets.baseline"]
+        exclude: ^tests/(corpus|integration)/
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.12
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: uv run mypy
+        language: system
+        pass_filenames: false
+        args: ["src/"]
+        files: ^src/
+      - id: guard-corpus
+        name: guard corpus (bash-matcher fixture harness)
+        entry: uv run guard corpus
+        language: system
+        pass_filenames: false
+        files: ^(tests/corpus/.*\.jsonl|src/guard/(hooks/bash_command_validator|registry|_corpus)\.py)$
+  - repo: https://github.com/jendrikseipp/vulture
+    rev: v2.16
+    hooks:
+      - id: vulture
+        args: ["--min-confidence=80", "src/guard", "tests", "vulture_whitelist.py"]
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.46.0
+    hooks:
+      - id: typos
+  - repo: local
+    hooks:
+      - id: pytest-on-push
+        name: pytest (full suite)
+        entry: uv run pytest -x
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+      - id: bandit-on-push
+        name: bandit (security lint)
+        entry: uv run --with bandit bandit -c pyproject.toml -r src/
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+      - id: zizmor-on-push
+        name: zizmor (workflow audit)
+        entry: uv run --with zizmor zizmor .
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+        files: ^\.github/workflows/.*\.ya?ml$
+      - id: semgrep-hook-rules
+        name: semgrep (hook rules)
+        entry: uv run --with semgrep semgrep scan --error
+          --config .semgrep/rules/no-prefix-predicate-in-readonly.yml
+          --config .semgrep/rules/no-startswith-in-predicate-field.yml
+          src/guard/hooks/
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+        files: ^src/guard/hooks/.*\.py$
+      - id: semgrep-test-hygiene
+        name: semgrep (test hygiene, ERROR-only)
+        entry: uv run --with semgrep semgrep scan --error --severity ERROR
+          --config .semgrep/rules/test-hygiene.yml tests/
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+        files: ^tests/.*\.py$
+      - id: semgrep-no-bare-noqa
+        name: semgrep (no bare noqa/type:ignore/nosec)
+        entry: uv run --with semgrep semgrep scan --error
+          --config .semgrep/rules/no-bare-noqa.yml
+          src/ tests/
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+        files: ^(src|tests)/.*\.py$
+      - id: claude-plugin-validate
+        name: claude plugin validate (manifest + command frontmatter)
+        entry: claude plugin validate .claude-plugin/plugin.json
+        language: system
+        files: ^(\.claude-plugin/.*\.json|commands/.*\.md|agents/.*\.md|skills/.*\.md)$
+        pass_filenames: false

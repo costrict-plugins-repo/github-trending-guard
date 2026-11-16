@@ -1,0 +1,169 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tracine-guard"
+version = "1.5.0"
+description = "Stdlib-only safety hooks plugin for Claude Code"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "TracineHQ contributors" }]
+keywords = ["claude-code", "claude-code-plugin", "safety", "hooks", "guardrails"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Environment :: Plugins",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+  "Topic :: Software Development :: Quality Assurance",
+  "Topic :: System :: Shells",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9.0.3",
+  "pytest-cov>=7.1.0",
+  "pytest-xdist>=3.8.0",
+  "pytest-timeout>=2.4.0",
+  "hypothesis>=6.150.0",
+  "pre-commit>=4.6.0",
+  "ruff>=0.15.12",
+  "mypy>=1.20.2",
+  "vulture>=2.16",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+# -n auto = pytest-xdist worker per CPU core (logical).
+# --dist=loadfile keeps every test in the same file on the same worker so
+# module-scoped fixtures (notably the shared JSONL log in test_plugin_e2e)
+# behave the same under parallel and serial runs. Different test files
+# still run in parallel — gives ~6x wall-time speedup over the default.
+addopts = [
+  "-n",
+  "auto",
+  "--dist",
+  "loadfile",
+  "--strict-markers",
+]
+
+[project.scripts]
+guard = "guard.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/TracineHQ/guard"
+Issues = "https://github.com/TracineHQ/guard/issues"
+Changelog = "https://github.com/TracineHQ/guard/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/TracineHQ/guard/tree/main/docs"
+"Security Policy" = "https://github.com/TracineHQ/guard/security/policy"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/guard"]
+
+[tool.coverage.run]
+branch = true
+source = ["src/guard"]
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: no cover",
+  "raise NotImplementedError",
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+]
+show_missing = true
+fail_under = 80
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = ["D203", "D213", "COM812", "ISC001"]
+pydocstyle.convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+  "S101",      # asserts are the point of pytest
+  "PLR2004",   # magic numbers in test fixtures are normal
+  "ANN",       # don't require type annotations on test fns
+  "D",         # don't require docstrings on test fns
+  "S603",      # subprocess-without-shell: every hook test spawns the hook script
+  "S108",      # /tmp string literals are payloads, not real fs operations
+  "PLC0415",   # local imports inside test fns / lazy hook imports
+  "N802",      # snake_case test names sometimes mirror spec terms (test_dash_F_short_form)
+  "ARG001",    # unused args used as pytest.param ids
+  "ARG002",    # side-effect-only pytest fixtures on test methods
+  "PTH111",    # os.path used in payload strings, not real path objects
+  "E402",      # grouped imports below header sections are intentional
+  "PT014",     # duplicate parametrize cases sometimes useful for human-readable grouping
+  "E501",      # long DENY/LEGIT case strings; readability beats wrap
+  "INP001",    # implicit namespace package; test dirs don't always have __init__.py
+  "TC003",     # pathlib.Path in test helpers is used at runtime, not type-check only
+  "RUF059",    # unpacked dummy variables in test setup are idiomatic
+]
+"src/guard/__init__.py" = ["D104"]
+"src/guard/hooks/bash_command_validator.py" = [
+  # The validator is a dispatcher of token-walk matchers — len-checks against
+  # 2/3/4 tokens are intrinsic to argv parsing, and each matcher has many
+  # small early-returns (one per detected shape). Naming each `_TOKENS_MIN`
+  # constant inflates the module without clarifying.
+  "PLR2004",   # magic value (token-count constants are obvious in context)
+  "PLR0911",   # too many return statements (each matcher is a chain of detect-and-deny)
+  "PLR0912",   # too many branches (matcher dispatchers)
+  "PLR0913",   # too many arguments (segment evaluators thread parsed state)
+  "PLR0915",   # too many statements (char-walk parsers: split/mask token loops)
+  "C901",      # cyclomatic complexity (matchers cover many shapes)
+  "SIM102",    # nested ifs are clearer for matcher dispatch
+  "SIM103",    # explicit return is clearer than `return cond`
+  "PLR1714",   # tuple `in` checks vs `or` — both fine, not worth churn
+  "S105",      # _SYNTH_*_DENY label names false-trip the password heuristic
+  "E501",      # long doc strings with rule lists
+]
+"src/guard/hooks/git_c_validator.py" = [
+  "PLR2004",   # magic token-index constants in argv parsing
+  "PLR0911",   # multi-form -c parser has one return per shape
+  "PLR0912",   # branches mirror the four argv shapes
+  "C901",      # cyclomatic complexity per shape
+]
+"src/guard/hooks/commit_message_validator.py" = [
+  "PLR0911",   # decide() returns one branch per sentinel/checker
+  "C901",      # _read_message_file dispatches stream/scope/sensitive/io
+  "S108",      # /tmp/ and /var/tmp/ are scope allowlist literals, not temp-file creates
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/guard"]
+
+[tool.vulture]
+paths = ["src/guard", "tests", "vulture_whitelist.py"]
+exclude = []
+min_confidence = 80
+ignore_decorators = ["@pytest.fixture", "@pytest.mark.parametrize"]
+
+[tool.bandit]
+exclude_dirs = ["tests", "dist", "build"]
+# B105 (hardcoded password): trips on _SYNTH_*_DENY label strings (e.g.
+#   "<gpg secret-key deletion>") that are dispatcher reason labels, not
+#   credentials. B108 (insecure temp dir): trips on the
+#   commit_message_validator scope-allowlist literals ("/tmp/", "/var/tmp/")
+#   that classify paths, not create files.
+skips = ["B105", "B108"]

@@ -1,0 +1,72 @@
+"""Vulture whitelist — symbols that vulture flags as dead but are live in production.
+
+Each entry references a symbol vulture cannot see being used. Run vulture with:
+
+    uv run --with vulture vulture src/guard tests vulture_whitelist.py --min-confidence 80
+
+Comments explain WHY the symbol is referenced outside vulture's static view.
+"""
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 TracineHQ contributors
+# ruff: noqa: B018
+# mypy: ignore-errors
+
+from guard import _utils
+from guard.hooks import (
+    agent_output_guard,
+    bash_command_validator,
+    commit_message_validator,
+    credential_check,
+    git_c_validator,
+    protected_files,
+    subagent_scope,
+)
+
+# --- Hook entry points ---
+# Every hook module exposes `hook()` as the Claude Code subprocess entry point
+# (wired via hooks/hooks.json -> guard.hooks.<module>:hook). Claude Code spawns
+# the hook script and pipes JSON over stdin; vulture cannot see those callers.
+# `decide()` is the pure-function core that tests import and call directly via
+# subprocess; it is also the documented extension point for downstream users.
+agent_output_guard.hook
+agent_output_guard.decide
+bash_command_validator.hook
+bash_command_validator.decide
+commit_message_validator.hook
+commit_message_validator.decide
+credential_check.hook
+credential_check.decide
+git_c_validator.hook
+git_c_validator.decide
+protected_files.hook
+subagent_scope.hook
+
+# --- Shared utility entry point ---
+# `safe_main()` is the boilerplate wrapper each hook module's `if __name__ == "__main__"`
+# block invokes. Vulture sees the import but not the runtime dispatch.
+_utils.safe_main
+
+# --- Public _utils constants ---
+# Env-driven config knobs read at module load. `GUARD_HOME` is referenced
+# indirectly through helpers (e.g. `global_allowlist_path()`) and by tests
+# that monkey-patch the env — vulture's static pass cannot follow that.
+_utils.GUARD_HOME
+
+# --- Test parametrize id args ---
+# `description` is consumed by @pytest.mark.parametrize as the human-readable
+# id (`id=d` in the param list) but never referenced in the test body. Pytest
+# reads it via the function signature; vulture sees an unused argument.
+description = None
+description
+
+# --- Pytest side-effect fixtures ---
+# These fixtures activate their behavior via test-function parameters that
+# pytest injects but the test body never references — vulture sees an unused
+# variable. The fixtures live in tests/conftest.py.
+strict_env = None
+strict_env
+decision_log_env = None
+decision_log_env
+log_with_permission_requests = None
+log_with_permission_requests

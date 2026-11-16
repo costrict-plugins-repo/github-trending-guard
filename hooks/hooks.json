@@ -1,0 +1,41 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/bin/run-hook bash_command_validator" },
+          { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/bin/run-hook git_c_validator" },
+          { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/bin/run-hook commit_message_validator" }
+        ]
+      },
+      {
+        "matcher": "Read|Bash",
+        "hooks": [
+          { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/bin/run-hook agent_output_guard" }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|Bash|Read|Glob|Grep|MultiEdit|NotebookEdit|WebFetch",
+        "hooks": [
+          { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/bin/run-hook credential_check" }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|Glob|Grep|WebFetch",
+        "hooks": [
+          { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/bin/run-hook protected_files" },
+          { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/bin/run-hook subagent_scope" }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/bin/run-hook permission_request_logger" }
+        ]
+      }
+    ]
+  }
+}

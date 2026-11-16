@@ -1,0 +1,275 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 TracineHQ contributors
+"""PreToolUse hook: enforce file-level scope on Edit/Write/MultiEdit/NotebookEdit.
+
+When ``<cwd>/.claude/subagent-scope.json`` is present with schema::
+
+    {
+      "task": "Task 2.1: ...",
+      "allowed": ["pkg/src/pkg/stats.py", "pkg/tests/test_*.py", "pkg/tests/"]
+    }
+
+any ``Edit`` or ``Write`` whose target ``file_path`` does not match an entry
+in ``allowed`` is denied. Missing or malformed scope files cause silent
+passthrough so hook errors never block work.
+
+For ``Bash``, every write-target shape that ``protected_files.bash_write_targets``
+recognises (redirects, ``cp``/``mv`` destinations, ``tee``, ``dd of=``, in-place
+editors) is run through the same scope check. This closes the bypass where a
+subagent with a tight Edit/Write scope shells out to ``echo > /etc/hosts``.
+
+Pattern semantics:
+
+- Trailing slash (``pkg/tests/``) → recursive directory match.
+- Glob chars (``*``, ``?``, ``[``) → ``fnmatch`` against the relative path.
+- Plain path → exact suffix match anchored on a ``/`` boundary.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import json
+from pathlib import Path
+from typing import Any
+
+from guard._utils import emit_pretooluse_decision, safe_main
+from guard.allowlist import apply_decision
+from guard.hooks.protected_files import bash_write_targets
+
+_HOOK_ID = "guard.subagent_scope"
+
+
+def load_scope(cwd: str) -> dict[str, Any] | None:
+    """Return the parsed scope dict, or ``None`` if absent/invalid."""
+    if not cwd:
+        return None
+    scope_path = Path(cwd) / ".claude" / "subagent-scope.json"
+    if not scope_path.exists():
+        return None
+    try:
+        data = json.loads(scope_path.read_text())
+    except (json.JSONDecodeError, OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    allowed = data.get("allowed")
+    if not isinstance(allowed, list):
+        return None
+    return data
+
+
+def _resolve_paths(file_path: str, cwd: str) -> tuple[str, str, bool]:
+    """Return ``(abs_path, rel_path, inside_cwd)``.
+
+    ``inside_cwd`` is ``True`` when ``abs_path`` is the same as ``cwd`` or a
+    descendant of it. When ``False`` the file is somewhere else on disk and
+    relative-path patterns must NOT match (closes the "endswith /pattern"
+    bypass that matched anywhere on the filesystem).
+
+    On any resolution error we fall back to the raw input strings and treat
+    the path as outside cwd.
+    """
+    try:
+        p = Path(file_path)
+        # Relative paths must resolve against the *payload* cwd (the agent's
+        # working directory at decide-time), not the hook *process* cwd. The
+        # process cwd is whatever Claude Code launched the hook from, which
+        # is generally unrelated to the agent's edit context.
+        if not p.is_absolute() and cwd:
+            p = Path(cwd) / p
+        abs_path = str(p.resolve())
+    except (ValueError, OSError):
+        abs_path = file_path
+    try:
+        cwd_resolved = str(Path(cwd).resolve())
+    except (ValueError, OSError):
+        cwd_resolved = cwd
+    inside_cwd = False
+    try:
+        rel_path = str(Path(abs_path).relative_to(cwd_resolved))
+        inside_cwd = True
+    except ValueError:
+        rel_path = abs_path
+    return abs_path, rel_path, inside_cwd
+
+
+def _matches_dir(pattern: str, abs_path: str, rel_path: str, *, inside_cwd: bool) -> bool:
+    """Recursive directory match for a trailing-slash pattern.
+
+    Absolute patterns (``/abs/dir/``) match against ``abs_path``; relative
+    patterns are anchored to ``rel_path`` and only fire when the file is
+    inside cwd.
+    """
+    if pattern.startswith("/"):
+        base = pattern.rstrip("/")
+        return abs_path == base or abs_path.startswith(base + "/")
+    if not inside_cwd:
+        return False
+    # Strip trailing slash for normalised comparison: "pkg/tests/" ~ "pkg/tests"
+    base = pattern.rstrip("/")
+    return rel_path == base or rel_path.startswith(base + "/")
+
+
+def _matches_glob(pattern: str, abs_path: str, rel_path: str, *, inside_cwd: bool) -> bool:
+    """Glob-match against the relative path only (when inside cwd).
+
+    Absolute glob patterns (starting with ``/``) match the absolute path.
+    A leading ``**/`` is rewritten to also match top-level files (e.g.
+    ``**/*.md`` matches ``README.md``); Python ``fnmatch`` is filesystem-blind
+    so the ``/`` in ``**/`` would otherwise require at least one directory
+    separator in the input.
+    """
+    if pattern.startswith("/"):
+        return fnmatch.fnmatch(abs_path, pattern)
+    if not inside_cwd:
+        return False
+    if fnmatch.fnmatch(rel_path, pattern):
+        return True
+    if pattern.startswith("**/"):
+        return fnmatch.fnmatch(rel_path, pattern[3:])
+    return False
+
+
+def _matches_plain(pattern: str, abs_path: str, rel_path: str, *, inside_cwd: bool) -> bool:
+    """Plain-path match anchored to cwd.
+
+    Strict matching: relative patterns must equal the relative path or be a
+    directory ancestor of it. Absolute patterns match the absolute path
+    exactly. (Earlier versions fell through to a filesystem-wide
+    ``abs_path.endswith("/" + pattern)`` check, which is no longer used.)
+    """
+    if pattern.startswith("/"):
+        return abs_path == pattern
+    if not inside_cwd:
+        return False
+    return rel_path == pattern or rel_path.startswith(pattern + "/")
+
+
+def _matches_pattern(pattern: str, abs_path: str, rel_path: str, *, inside_cwd: bool) -> bool:
+    """Dispatch a single allowlist pattern against ``abs_path`` / ``rel_path``."""
+    if pattern.endswith("/"):
+        return _matches_dir(pattern, abs_path, rel_path, inside_cwd=inside_cwd)
+    if any(c in pattern for c in "*?["):
+        return _matches_glob(pattern, abs_path, rel_path, inside_cwd=inside_cwd)
+    return _matches_plain(pattern, abs_path, rel_path, inside_cwd=inside_cwd)
+
+
+def is_allowed(file_path: str, cwd: str, allowed: list[Any]) -> bool:
+    """Check if ``file_path`` matches any pattern in ``allowed``."""
+    abs_path, rel_path, inside_cwd = _resolve_paths(file_path, cwd)
+    return any(
+        isinstance(pattern, str)
+        and pattern
+        and _matches_pattern(pattern, abs_path, rel_path, inside_cwd=inside_cwd)
+        for pattern in allowed
+    )
+
+
+_SCOPED_TOOLS: frozenset[str] = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
+
+
+def _extract_file_and_cwd(payload: dict[str, Any]) -> tuple[str, str] | None:
+    """Return ``(file_path, cwd)`` if both present and well-typed, else ``None``.
+
+    NotebookEdit uses ``notebook_path`` instead of ``file_path``; the others
+    all use ``file_path``.
+    """
+    if payload.get("tool_name") not in _SCOPED_TOOLS:
+        return None
+
+    tool_input = payload.get("tool_input", {}) or {}
+    if not isinstance(tool_input, dict):
+        return None
+    file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+    cwd = payload.get("cwd", "")
+    if not isinstance(file_path, str) or not file_path:
+        return None
+    if not isinstance(cwd, str) or not cwd:
+        return None
+    return file_path, cwd
+
+
+def _emit_deny(
+    *,
+    payload: dict[str, Any],
+    file_path: str,
+    scope: dict[str, Any],
+    allowed_raw: list[Any],
+) -> None:
+    """Emit the standard scope-violation deny (exits 2 unless guard mode says otherwise)."""
+    task = scope.get("task", "current task")
+    allowed_list = "\n".join(f"  - {p}" for p in allowed_raw if isinstance(p, str))
+    reason = (
+        f"Out of scope for {task}. This file is not in the allowed list.\n"
+        f"Allowed files/patterns:\n{allowed_list}\n"
+        f"If you need to modify other files, the task scope needs updating."
+    )
+    envelope = emit_pretooluse_decision("deny", reason)
+    # Not allowlist-overridable (the registry sets supports_disable_hook=False).
+    apply_decision(_HOOK_ID, payload, envelope, file_path, overridable=False)
+
+
+def _handle_bash(payload: dict[str, Any]) -> None:
+    """Enforce scope on Bash write-target shapes (redirects, cp/mv, tee, dd, ...)."""
+    tool_input = payload.get("tool_input", {}) or {}
+    if not isinstance(tool_input, dict):
+        return
+    command = tool_input.get("command", "")
+    if not isinstance(command, str) or not command:
+        return
+    cwd = payload.get("cwd", "")
+    if not isinstance(cwd, str) or not cwd:
+        return
+
+    scope = load_scope(cwd)
+    if scope is None:
+        return
+
+    allowed_raw = scope.get("allowed", [])
+    if not isinstance(allowed_raw, list):
+        return
+
+    for target in bash_write_targets(command):
+        if not target:
+            continue
+        if is_allowed(target, cwd, allowed_raw):
+            continue
+        _emit_deny(
+            payload=payload,
+            file_path=target,
+            scope=scope,
+            allowed_raw=allowed_raw,
+        )
+
+
+def hook(payload: dict[str, Any]) -> None:
+    """Top-level hook entry point."""
+    tool_name = payload.get("tool_name")
+
+    if tool_name == "Bash":
+        _handle_bash(payload)
+        return
+
+    parsed = _extract_file_and_cwd(payload)
+    if parsed is None:
+        return
+    file_path, cwd = parsed
+
+    scope = load_scope(cwd)
+    if scope is None:
+        return
+
+    allowed_raw = scope.get("allowed", [])
+    if not isinstance(allowed_raw, list) or is_allowed(file_path, cwd, allowed_raw):
+        return
+
+    _emit_deny(
+        payload=payload,
+        file_path=file_path,
+        scope=scope,
+        allowed_raw=allowed_raw,
+    )
+
+
+if __name__ == "__main__":
+    safe_main(hook)

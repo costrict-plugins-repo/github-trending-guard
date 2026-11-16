@@ -1,0 +1,40 @@
+default: check
+
+install:
+    uv sync --all-extras
+
+check: lint typecheck test
+
+lint:
+    uv run ruff check .
+    uv run ruff format --check .
+
+format-check:
+    uv run ruff format --check .
+
+fmt:
+    uv run ruff check --fix .
+    uv run ruff format .
+
+typecheck:
+    uv run mypy src/
+
+test:
+    uv run pytest
+
+test-fast:
+    uv run pytest -x --ff -q
+
+test-e2e:
+    uv run pytest tests/integration/test_plugin_e2e.py -v
+
+# Run the runtime subprocess invocation test (mimics Claude Code's invocation).
+test-runtime-hooks:
+    uv run pytest tests/integration/test_hook_subprocess_invocation.py -v
+
+test-cov:
+    uv run pytest --cov=src/guard --cov-report=term-missing
+
+# Run semgrep regression rules locally.
+semgrep:
+    uv run --with semgrep semgrep scan --error --config .semgrep/rules/ src/guard/hooks/

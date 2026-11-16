@@ -1,0 +1,540 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 TracineHQ contributors
+"""PreToolUse hook: validate ``git -C <path>`` commands.
+
+Allows read-only git subcommands invoked with ``-C <path>``, denies
+destructive ones, and denies unknown subcommands with a steer to run them
+from inside the repo (``cd <path> && git ...``). Works at any path depth
+(bypasses the glob ``*`` vs ``/`` limitation in permission rules).
+
+IMPORTANT: this hook only evaluates a single, operator-free command.
+If the input contains shell operators (``&&``, ``||``, ``;``, ``|``) it
+declines to auto-allow because ``shlex`` cannot reliably parse those
+boundaries — fallthrough lets the normal permission system handle them.
+"""
+
+from __future__ import annotations
+
+import shlex
+from typing import Any
+
+from guard._utils import emit_pretooluse_decision, safe_main
+from guard.allowlist import apply_decision
+from guard.registry import git_read_exec_violation, git_ref_violation
+
+_HOOK_ID = "guard.git_c_validator"
+
+# Read-only git subcommands — safe to auto-allow
+ALLOWED_SUBCOMMANDS: frozenset[str] = frozenset(
+    {
+        "status",
+        "log",
+        "diff",
+        "show",
+        "branch",
+        "remote",
+        "blame",
+        "rev-parse",
+        "describe",
+        "tag",
+        "ls-files",
+        "ls-tree",
+        "grep",
+        "stash",
+        "shortlog",
+        "cat-file",
+        "rev-list",
+        "name-rev",
+        "for-each-ref",
+        "reflog",
+        "count-objects",
+        "fsck",
+        "verify-pack",
+    }
+)
+
+# Destructive subcommands — hard deny with -C
+DENIED_SUBCOMMANDS: frozenset[str] = frozenset({"clean", "reset"})
+
+# Read-only-by-default subcommands that become destructive with certain flags or
+# flags (branch -D, tag -d, remote add/remove, log --output=, grep
+# --open-files-in-pager) are classified by the shared ``git_read_exec_violation``
+# (RCE-class -> deny) and ``git_ref_violation`` (ref create/mutate -> deny)
+# predicates in registry.py -- one source of truth with the bash matcher, so
+# the two paths cannot drift.
+
+# Stash sub-subcommands that are destructive
+DENIED_STASH_ACTIONS: frozenset[str] = frozenset({"pop", "drop", "clear"})
+
+# Flags that consume the next argument (so we don't misidentify it as a subcommand)
+FLAGS_WITH_ARGS: frozenset[str] = frozenset(
+    {
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "-C",
+    }
+)
+
+# Length of "-C" prefix for inline ``-C/path`` (no space) form
+_DASH_C_PREFIX_LEN = 2
+
+_SHELL_OPERATOR_CHARS: frozenset[str] = frozenset({"|", ";"})
+
+
+def has_shell_operators(command: str) -> bool:
+    """Return ``True`` if the command contains an unquoted shell operator."""
+    try:
+        shlex.split(command)
+    except ValueError:
+        return True
+
+    in_quote = False
+    quote_char: str | None = None
+    i = 0
+    while i < len(command):
+        c = command[i]
+        if not in_quote:
+            if c in ('"', "'"):
+                in_quote = True
+                quote_char = c
+            elif (
+                c == "&" and i + 1 < len(command) and command[i + 1] == "&"
+            ) or c in _SHELL_OPERATOR_CHARS:
+                return True
+        elif c == quote_char and (i == 0 or command[i - 1] != "\\"):
+            in_quote = False
+            quote_char = None
+        i += 1
+    return False
+
+
+def parse_git_c_command(
+    command: str,
+) -> tuple[str | None, str | None, list[str]]:
+    """Extract ``(path, subcommand, remaining_args)`` from a ``git -C`` call."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None, None, []
+
+    if not parts or parts[0] != "git":
+        return None, None, []
+
+    i = 1
+    path: str | None = None
+    while i < len(parts):
+        if parts[i] == "-C" and i + 1 < len(parts):
+            path = parts[i + 1]
+            i += 2
+        elif parts[i].startswith("-C") and len(parts[i]) > _DASH_C_PREFIX_LEN:
+            path = parts[i][_DASH_C_PREFIX_LEN:]
+            i += 1
+        elif parts[i] in FLAGS_WITH_ARGS and i + 1 < len(parts):
+            i += 2
+        elif parts[i].startswith("-"):
+            i += 1
+        else:
+            return path, parts[i], parts[i + 1 :]
+
+    return path, None, []
+
+
+_CONFIG_READ_FLAGS: frozenset[str] = frozenset(
+    {"--get", "--list", "-l", "--get-all", "--get-regexp"}
+)
+
+
+def _decide_config(remaining: list[str], *, path: str = "<repo>") -> dict[str, Any]:
+    """Decide a ``git -C ... config ...`` invocation."""
+    if remaining and remaining[0] in _CONFIG_READ_FLAGS:
+        return emit_pretooluse_decision("allow", "git -C: 'config' with read-only flag")
+    return emit_pretooluse_decision(
+        "deny",
+        "git -C: 'config' writes are blocked because they can point git at "
+        f"hooks or exec helpers in another repo. Run it from inside the repo "
+        f"(`cd {path} && git config ...`) so the change is visible in context, "
+        "or tell the user which setting you need.",
+    )
+
+
+def _decide_stash(remaining: list[str]) -> dict[str, Any] | None:
+    """Decide a ``git -C ... stash <action>`` invocation, or fall through."""
+    if not remaining:
+        return None
+    action = remaining[0]
+    if action in DENIED_STASH_ACTIONS:
+        return emit_pretooluse_decision("deny", f"git -C: 'stash {action}' is destructive")
+    if action in ("list", "show"):
+        return emit_pretooluse_decision("allow", f"git -C: 'stash {action}' is read-only")
+    return None
+
+
+def _classify_subcommand(
+    subcommand: str, remaining: list[str], *, path: str = "<repo>"
+) -> dict[str, Any]:
+    """Classify a parsed subcommand into an allow/deny envelope."""
+    return _classify_with_rule(subcommand, remaining, path=path)[0]
+
+
+def _classify_with_rule(
+    subcommand: str, remaining: list[str], *, path: str = "<repo>"
+) -> tuple[dict[str, Any], str]:
+    """Envelope plus the tier key (``guard.git_c_validator:<shape>``) behind it."""
+    if subcommand == "config":
+        return _decide_config(remaining, path=path), _rule("config_write")
+    if subcommand == "stash":
+        stash_decision = _decide_stash(remaining)
+        if stash_decision is not None:
+            return stash_decision, _rule("stash")
+    if subcommand == "fetch":
+        return _decide_fetch(remaining, path=path)
+    if subcommand in DENIED_SUBCOMMANDS:
+        envelope = emit_pretooluse_decision(
+            "deny", f"git -C: '{subcommand}' is destructive and blocked"
+        )
+        return envelope, _rule("destructive")
+    # Read-only subcommands coerced into a file write or external-program exec
+    # (git log --output=, git grep --open-files-in-pager). RCE-class -> deny.
+    exec_violation = git_read_exec_violation(subcommand, remaining)
+    if exec_violation is not None:
+        envelope = emit_pretooluse_decision(
+            "deny",
+            f"git -C: '{subcommand} {exec_violation}' writes a file or execs and is blocked",
+        )
+        return envelope, _rule("read_exec")
+    # Ref create/mutate: branch/tag <name> creation, branch -d/-D/-m, tag -a/-d,
+    # remote add/.... ``include_creation=True`` -- a ref write is denied in
+    # interactive ``-C`` too, matching the bash ``bash.git_ref_mutation`` floor.
+    # Shared predicate so the two paths cannot drift.
+    ref_violation = git_ref_violation(subcommand, remaining, include_creation=True)
+    if ref_violation is not None:
+        envelope = emit_pretooluse_decision(
+            "deny",
+            f"git -C: '{subcommand} {ref_violation}' creates or mutates a ref and is blocked",
+        )
+        return envelope, _rule("ref_mutation")
+    if subcommand in ALLOWED_SUBCOMMANDS:
+        return emit_pretooluse_decision("allow", f"git -C: '{subcommand}' is read-only"), _HOOK_ID
+    return _not_read_only(subcommand, path)
+
+
+def _rule(shape: str) -> str:
+    """Tier key for one deny shape; the allowlist key stays the hook id."""
+    return f"{_HOOK_ID}:{shape}"
+
+
+def _not_read_only(subcommand: str, path: str) -> tuple[dict[str, Any], str]:
+    envelope = emit_pretooluse_decision(
+        "deny",
+        f"git -C: '{subcommand}' isn't on the read-only list. Run it from inside "
+        f"the repo instead: `cd {path} && git {subcommand} ...`.",
+    )
+    return envelope, _rule("not_read_only")
+
+
+# ``git fetch`` flags that do more than update remote-tracking refs: prune or
+# force-update local refs, touch HEAD, or write upstream config.
+_FETCH_WRITE_FLAGS: frozenset[str] = frozenset(
+    {
+        "-p",
+        "-P",
+        "--prune",
+        "--prune-tags",
+        "-f",
+        "--force",
+        "-u",
+        "--update-head-ok",
+        "--set-upstream",
+        "--refmap",
+    }
+)
+
+# ``git fetch`` options whose value may follow as a separate token.
+_FETCH_VALUE_FLAGS: frozenset[str] = frozenset(
+    {
+        "--depth",
+        "--deepen",
+        "--shallow-since",
+        "--shallow-exclude",
+        "-j",
+        "--jobs",
+        "--filter",
+        "--negotiation-tip",
+        "-o",
+        "--server-option",
+        "--recurse-submodules-default",
+        "--submodule-prefix",
+    }
+)
+
+
+def _decide_fetch(remaining: list[str], *, path: str) -> tuple[dict[str, Any], str]:
+    """``git -C <repo> fetch``: allowed unless it runs a program or writes local refs.
+
+    ``--upload-pack`` names a program to run and an ``ext::`` remote runs a
+    command, so both are exec-class. Prune / force / ``--set-upstream`` flags
+    and a ``src:dst`` or ``+`` refspec write local refs or config; those get
+    the run-it-from-inside-the-repo steer.
+    """
+    positionals = 0
+    skip_value = False
+    for arg in remaining:
+        if skip_value:
+            skip_value = False
+            continue
+        flag = arg.split("=", 1)[0]
+        if flag in {"--upload-pack", "--exec"} or arg.startswith("ext::"):
+            envelope = emit_pretooluse_decision(
+                "deny", f"git -C: 'fetch {flag}' runs a program and is blocked"
+            )
+            return envelope, _rule("read_exec")
+        if flag in _FETCH_WRITE_FLAGS:
+            return _not_read_only("fetch", path)
+        if arg.startswith("-"):
+            skip_value = arg in _FETCH_VALUE_FLAGS
+            continue
+        positionals += 1
+        # The first positional is the repository (``user@host:path`` has a
+        # colon too); every later one is a refspec, and ``src:dst`` / ``+src``
+        # writes a local ref.
+        if positionals > 1 and (arg.startswith("+") or ":" in arg):
+            return _not_read_only("fetch", path)
+    envelope = emit_pretooluse_decision(
+        "allow", "git -C: 'fetch' only updates remote-tracking refs"
+    )
+    return envelope, _HOOK_ID
+
+
+_COMMIT_HEAD_TOKENS = 3  # ['git', 'commit', <at least one more arg>]
+
+
+def _is_reuse_token(tok: str, idx: int, parts: list[str]) -> bool:
+    """Return True iff ``tok`` at position ``idx`` requests prior-message reuse."""
+    if tok == "-C" and idx + 1 < len(parts):
+        return True
+    if tok.startswith("-C") and len(tok) > _DASH_C_PREFIX_LEN and not tok.startswith("--"):
+        return True
+    if tok == "--reuse-message" and idx + 1 < len(parts):
+        return True
+    return tok.startswith("--reuse-message=")
+
+
+def _skip_git_global_flags(parts: list[str]) -> int:
+    """Return the index of the first non-global-flag token after ``git``.
+
+    Walks past ``-C <path>``, ``-c <key=val>``, ``--git-dir <path>``,
+    ``--work-tree <path>``, ``--namespace <ns>``, ``--exec-path``, ``-p``,
+    etc. so that ``git -C /tmp commit -C HEAD`` parses as the ``commit`` shape.
+    """
+    if not parts or parts[0] != "git":
+        return 0
+    i = 1
+    n = len(parts)
+    consume_next = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
+    while i < n:
+        tok = parts[i]
+        if tok in consume_next and i + 1 < n:
+            i += 2
+            continue
+        if "=" in tok and tok.split("=", 1)[0] in {"--git-dir", "--work-tree", "--namespace"}:
+            i += 1
+            continue
+        if tok.startswith("-") and not tok.startswith("--"):
+            # Bundled short flags / inline -C/path form are global.
+            i += 1
+            continue
+        if tok.startswith("--") and tok != "--":
+            # Long-form valueless global flags (--no-pager, --bare, --paginate).
+            i += 1
+            continue
+        break
+    return i
+
+
+def _is_commit_reuse(command: str) -> bool:
+    """Return ``True`` if the command silently reuses a prior commit message.
+
+    Matches ``git commit -C <ref>`` and ``git commit --reuse-message=<ref>``,
+    including when a ``-C <path>`` / ``--git-dir <path>`` global flag prefixes
+    the ``commit`` subcommand. These let an agent append to history without
+    authoring a new message, which defeats the audit trail commit_message_validator
+    is meant to enforce.
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    sub_idx = _skip_git_global_flags(parts)
+    if sub_idx >= len(parts) or parts[sub_idx] != "commit":
+        return False
+    rest = parts[sub_idx + 1 :]
+    return any(_is_reuse_token(tok, i, rest) for i, tok in enumerate(rest))
+
+
+# ``-c key=value`` paths-config keys whose value would point the next git
+# subcommand at attacker-controlled hooks/attributes. There is no legitimate
+# reason to override these via the command line — repo-local hooks live in
+# ``.git/hooks/``, repo attributes live in ``.gitattributes``, and any
+# permanent override goes through ``git config``. Treat any ``-c`` override
+# of these keys as malicious regardless of value: relative-path traversal
+# (``../``) AND absolute paths (``/tmp/evil``) are equally dangerous.
+_DANGEROUS_PATHS_CONFIG_KEYS: frozenset[str] = frozenset(
+    {"core.hookspath", "core.attributesfile"},
+)
+
+
+def _normalize_config_key(key: str) -> str:
+    """Lowercase and strip whitespace for git config-key matching."""
+    return key.strip().lower()
+
+
+def _check_dangerous_kv(kv: str) -> tuple[str, str] | None:
+    """Return ``(key, value)`` if ``kv`` overrides a dangerous paths-config key."""
+    if "=" not in kv:
+        return None
+    key, value = kv.split("=", 1)
+    if _normalize_config_key(key) in _DANGEROUS_PATHS_CONFIG_KEYS:
+        return key, value
+    return None
+
+
+def _has_dangerous_paths_config(command: str) -> tuple[str, str] | None:
+    """Return ``(key, value)`` if a ``-c`` paths-config override is present.
+
+    Matches all four argv shapes git accepts:
+    - ``-c key=value``                  (canonical, two tokens)
+    - ``-c=key=value``                  (single-token form)
+    - ``-ckey=value``                   (fused short-flag form)
+    - ``--config-env=key=ENVVAR``       (env-indirect override; we deny on key alone)
+
+    The fused form (``-ccore.hooksPath=/tmp/evil``) was the original bypass:
+    a per-token ``parts[i] == "-c"`` walk would skip it entirely. Now we
+    handle the fused form first, then fall through to the multi-token forms.
+    Denies any value, not just traversal — absolute paths to attacker-controlled
+    locations bypass a traversal-only check. The next git subcommand in the
+    same invocation would load hooks/attributes from the override target.
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    if not parts or parts[0] != "git":
+        return None
+    i = 1
+    while i < len(parts):
+        tok = parts[i]
+        # Canonical: -c <key=value>
+        if tok == "-c" and i + 1 < len(parts):
+            hit = _check_dangerous_kv(parts[i + 1])
+            if hit is not None:
+                return hit
+            i += 2
+            continue
+        # Equals form: -c=key=value (rare but valid)
+        if tok.startswith("-c=") and len(tok) > len("-c="):
+            hit = _check_dangerous_kv(tok[len("-c=") :])
+            if hit is not None:
+                return hit
+            i += 1
+            continue
+        # Fused short flag: -ccore.hooksPath=/tmp/evil
+        if tok.startswith("-c") and len(tok) > 2 and "=" in tok:
+            hit = _check_dangerous_kv(tok[2:])
+            if hit is not None:
+                return hit
+            i += 1
+            continue
+        # Long-form env override: --config-env=key=ENVVAR
+        if tok.startswith("--config-env="):
+            payload = tok[len("--config-env=") :]
+            # payload is key=ENVVAR; take the key half and check it.
+            if "=" in payload:
+                env_key = payload.split("=", 1)[0]
+                if _normalize_config_key(env_key) in _DANGEROUS_PATHS_CONFIG_KEYS:
+                    return env_key, "<env-indirect>"
+            i += 1
+            continue
+        if tok == "--config-env" and i + 1 < len(parts):
+            payload = parts[i + 1]
+            if "=" in payload:
+                env_key = payload.split("=", 1)[0]
+                if _normalize_config_key(env_key) in _DANGEROUS_PATHS_CONFIG_KEYS:
+                    return env_key, "<env-indirect>"
+            i += 2
+            continue
+        i += 1
+    return None
+
+
+def decide(command: str) -> dict[str, Any] | None:
+    """Return a permission envelope, or ``None`` to fall through."""
+    return decide_with_rule(command)[0]
+
+
+def decide_with_rule(command: str) -> tuple[dict[str, Any] | None, str]:
+    """``decide`` plus the tier key behind the decision (see ``guard.registry``)."""
+    if has_shell_operators(command):
+        return None, _HOOK_ID
+    dangerous = _has_dangerous_paths_config(command)
+    if dangerous is not None:
+        key, value = dangerous
+        envelope = emit_pretooluse_decision(
+            "deny",
+            (
+                f"git -c {key}={value}: command-line override of "
+                "core.hooksPath / core.attributesFile is a known exploit "
+                "shape — the next git subcommand would load hooks or "
+                "attributes from the override target. No legitimate use "
+                "for this at the CLI; use `git config` for permanent "
+                "settings or `.git/hooks/` for repo-local hooks."
+            ),
+        )
+        return envelope, _rule("paths_config")
+    if _is_commit_reuse(command):
+        envelope = emit_pretooluse_decision(
+            "deny",
+            "git commit -C / --reuse-message: silent commit-message reuse is blocked",
+        )
+        return envelope, _rule("commit_reuse")
+    path, subcommand, remaining = parse_git_c_command(command)
+    if path is None or subcommand is None:
+        return None, _HOOK_ID
+    return _classify_with_rule(subcommand, remaining, path=path)
+
+
+def hook(payload: dict[str, Any]) -> None:
+    """Top-level hook entry point."""
+    tool_name = payload.get("tool_name", "")
+    if tool_name != "Bash":
+        return
+
+    tool_input = payload.get("tool_input", {}) or {}
+    if not isinstance(tool_input, dict):
+        return
+    command = tool_input.get("command", "")
+    if not isinstance(command, str) or not command:
+        return
+    # Token-aware gate: any `git` invocation with a `-C`/`-c` global option
+    # (in any of its argv shapes — bare, fused, equals, --config-env) or a
+    # `git commit` subcommand reaches `decide()`. The previous substring
+    # gate ("git -c " with trailing space) skipped the fused form
+    # `git -ccore.hooksPath=...`, leaving the new fused-form parser dead.
+    try:
+        head = shlex.split(command)
+    except ValueError:
+        head = command.split()
+    if not head or head[0] != "git":
+        return
+    rest = head[1:]
+    has_config_or_dir_flag = any(t.startswith(("-C", "-c", "--config-env")) for t in rest)
+    if not has_config_or_dir_flag and "commit" not in rest:
+        return
+
+    envelope, rule = decide_with_rule(command)
+    if envelope is not None:
+        apply_decision(_HOOK_ID, payload, envelope, command, rule=rule)
+
+
+if __name__ == "__main__":
+    safe_main(hook)
